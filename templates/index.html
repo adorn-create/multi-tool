@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="csrf-token" content="{{ csrf_token() }}">
+  <title>Kali AI Assistant</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Kali AI Assistant home">
+        <span class="brand-mark small" aria-hidden="true">K</span>
+        <span>Kali <span class="brand-light">Assistant</span></span>
+      </a>
+      <div class="topbar-right">
+        <span class="model-pill"><span class="status-dot"></span>{{ model_name }}</span>
+        <form method="post" action="{{ url_for('logout') }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <button class="quiet-button" type="submit">Sign out</button>
+        </form>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="welcome" id="welcome">
+        <div class="welcome-icon" aria-hidden="true">✳</div>
+        <p class="eyebrow">YOUR PRIVATE AI WORKSPACE</p>
+        <h1>What can I help you with?</h1>
+        <p class="muted">Ask a question or request a task on your authorized Kali VM.</p>
+        <div class="suggestions">
+          <button type="button" class="suggestion" data-prompt="Explain what a port scan does">Explain a security concept <span>↗</span></button>
+          <button type="button" class="suggestion" data-prompt="Show me how to check disk space on my Kali VM">Check my VM's disk space <span>↗</span></button>
+        </div>
+      </section>
+
+      <section class="conversation" id="conversation" aria-live="polite" aria-label="Conversation"></section>
+
+      <div class="composer-wrap">
+        <form class="composer" id="chat-form">
+          <label class="sr-only" for="prompt">Message the assistant</label>
+          <textarea id="prompt" rows="1" maxlength="2000" placeholder="Message your assistant…" required></textarea>
+          <button class="send-button" id="send-button" type="submit" aria-label="Send message">↑</button>
+        </form>
+        <div class="composer-note">AI can make mistakes. Review every command before it runs.</div>
+      </div>
+    </main>
+  </div>
+</body>
+</html>
