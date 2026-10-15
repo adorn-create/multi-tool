@@ -21,9 +21,9 @@ OLLAMA_HOST = os.getenv(
     "OLLAMA_HOST",
     "https://ollama.com" if OLLAMA_API_KEY else "http://localhost:11434",
 ).strip().rstrip("/")
-OLLAMA_MODEL_DEFAULT = (
-    "gpt-oss:120b" if urlparse(OLLAMA_HOST).hostname == "ollama.com" else "qwen2.5:14b"
-)
+OLLAMA_HOSTNAME = urlparse(OLLAMA_HOST).hostname
+IS_OFFICIAL_OLLAMA_CLOUD = OLLAMA_HOSTNAME == "ollama.com"
+OLLAMA_MODEL_DEFAULT = "gpt-oss:120b" if IS_OFFICIAL_OLLAMA_CLOUD else "qwen2.5:14b"
 MODEL_NAME = os.getenv(
     "OLLAMA_MODEL",
     OLLAMA_MODEL_DEFAULT,
@@ -74,7 +74,11 @@ def parse_ai_response(response_text: str) -> tuple[str, str, str]:
 
 
 def create_ollama_client() -> Client:
-    headers = {"Authorization": f"Bearer {OLLAMA_API_KEY}"} if OLLAMA_API_KEY else {}
+    headers = (
+        {"Authorization": f"Bearer {OLLAMA_API_KEY}"}
+        if OLLAMA_API_KEY and IS_OFFICIAL_OLLAMA_CLOUD
+        else {}
+    )
     return Client(host=OLLAMA_HOST, headers=headers)
 
 
@@ -349,10 +353,17 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         except ResponseError as exc:
             current_app.logger.exception("Ollama request failed.")
             if exc.status_code in (401, 403):
-                message = (
-                    "Ollama rejected authentication. Check the OLLAMA_API_KEY secret if using Ollama Cloud, "
-                    "or verify the endpoint configured in OLLAMA_HOST."
-                )
+                host = urlparse(OLLAMA_HOST).hostname or "configured Ollama host"
+                detail = exc.error.strip()[:300]
+                if host == "ollama.com":
+                    message = "Ollama Cloud rejected authentication. Check the OLLAMA_API_KEY secret and account access."
+                else:
+                    message = (
+                        f"The configured Ollama endpoint ({host}) rejected authentication. "
+                        "Check whether the Railway service or tunnel requires its own access credentials."
+                    )
+                if detail:
+                    message += f" Server response: {detail}"
             elif exc.status_code == 404:
                 message = (
                     f'Ollama could not find model "{MODEL_NAME}". Set OLLAMA_MODEL to a model available '
