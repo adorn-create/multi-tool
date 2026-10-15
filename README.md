@@ -1,7 +1,7 @@
 ---
 title: Kali AI Assistant
 sdk: docker
-app_port: 7860
+app_port: 8080
 ---
 
 # Kali AI Assistant website
@@ -24,7 +24,7 @@ $env:KALI_VM_USER = "your-vm-username"
 .\.venv\Scripts\python.exe .\ai.py
 ```
 
-Open `http://127.0.0.1:8000`. Create the cloud API key in [Ollama API keys](https://ollama.com/settings/keys). `OLLAMA_API_KEY` selects direct Ollama Cloud by default; the app sends it only from the server to `https://ollama.com`. Use a model name supported by the cloud API, such as `gpt-oss:120b`, and set `OLLAMA_MODEL` to choose another. For local Ollama instead, omit `OLLAMA_API_KEY` and set `OLLAMA_HOST=http://localhost:11434`.
+Open `http://127.0.0.1:8080`. Create the cloud API key in [Ollama API keys](https://ollama.com/settings/keys). `OLLAMA_API_KEY` selects direct Ollama Cloud by default; the app sends it only from the server to `https://ollama.com`. Use a model name supported by the cloud API, such as `gpt-oss:120b`, and set `OLLAMA_MODEL` to choose another. For a separately hosted Ollama server (including Railway), set `OLLAMA_HOST` to its reachable base URL and `OLLAMA_MODEL` to a model installed on that server, for example `qwen2.5:14b`. For local Ollama, omit `OLLAMA_API_KEY` and set `OLLAMA_HOST=http://localhost:11434`.
 
 ## Public hosting
 
@@ -38,10 +38,25 @@ The Dockerfile works with Render and Hugging Face Spaces Docker. Configure these
 | `OLLAMA_HOST` | `https://ollama.com` for direct cloud API (default when the API key is set) |
 | `OLLAMA_MODEL` | Cloud model identifier, e.g. `gpt-oss:120b` |
 | `WEB_HOST` | Set to `0.0.0.0` in the container platform |
-| `PORT` / `WEB_PORT` | Platform port (`PORT` is detected automatically; otherwise set `WEB_PORT`, usually `10000` for Render or `7860` for Hugging Face Spaces) |
+| `PORT` / `WEB_PORT` | Platform port (`PORT` is detected automatically; otherwise set `WEB_PORT`, usually `10000` for Render or `8080` for Hugging Face Spaces) |
 | `SESSION_COOKIE_SECURE` | Set to `true` when the public site is served over HTTPS |
+| `SESSION_IDLE_TIMEOUT_MINUTES` | Minutes without activity before automatic sign-out (default `15`) |
 | `ALLOW_VM_COMMANDS` | Leave unset/false to disable VM shell commands (secure default) |
 
-For Render, create a **Docker** web service from this repository and set its environment variables in the Render dashboard. For Hugging Face Spaces, create a **Docker Space**, add the secrets under Space Settings, and set `WEB_PORT=7860`. In either case, generate `FLASK_SECRET_KEY` with a cryptographically random value. The shared password gives every person who knows it the same access; rotate it if it is shared beyond the intended group.
+For an Ollama server deployed separately on Railway, set `OLLAMA_HOST` in the website service's Variables to the Ollama service's private URL (preferred when both services are in the same Railway project) or a secured Cloudflare tunnel URL. Set `OLLAMA_MODEL=qwen2.5:14b` only if that model is pulled/available on the Ollama service. The app uses `qwen2.5:14b` as its default model when `OLLAMA_API_KEY` is not set; when using direct Ollama Cloud, it defaults to `gpt-oss:120b`. Restart/redeploy the website service after changing Variables. Never put the Cloudflare tunnel URL or Ollama API key in browser code.
+
+### Fixing a container startup error about missing secrets
+
+The app intentionally refuses to start unless `SITE_PASSWORD` and `FLASK_SECRET_KEY` are set. They must be configured on the hosting platform; adding them to the Dockerfile or committing them to this repository would expose the website password.
+
+For a Hugging Face Space, open the Space's **Settings → Variables and secrets → Secrets**, add:
+
+1. `SITE_PASSWORD` — the password you chose for entering the website.
+2. `FLASK_SECRET_KEY` — a long random value generated once and kept stable across restarts. Generate one locally with `python -c "import secrets; print(secrets.token_hex(32))"` and paste the result as the secret value.
+3. `OLLAMA_API_KEY` — the API key from [Ollama API keys](https://ollama.com/settings/keys), if using Ollama Cloud.
+
+Save the secrets and restart/rebuild the Space. The Docker image exposes port `8080`, and the Space metadata uses `app_port: 8080`. Do not paste the secret values into chat, source files, or build logs. For Render, add the same keys under the service's **Environment** settings and redeploy; Render's `PORT` variable overrides the Docker default.
+
+The shared password gives every person who knows it the same access; rotate it if it is shared beyond the intended group.
 
 The site can use Ollama Cloud without hosting an AI model. It still needs network access to the Kali VM if VM commands are enabled. On Render/Spaces, a VM on a private home LAN is normally unreachable; do not expose SSH publicly just to make this work. Keep `ALLOW_VM_COMMANDS` unset unless you have arranged secure private connectivity. If enabling it, also configure `KALI_VM_IP`, `KALI_VM_USER`, and either `KALI_VM_PASS` or `KALI_SSH_KEY`; verify the host key and set `KALI_SSH_KNOWN_HOSTS`. Commands then require the visitor to click a confirmation in the page. The app does not automatically trust unknown VM host keys.

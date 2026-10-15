@@ -5,6 +5,7 @@ import os
 import secrets
 import time
 from collections import defaultdict, deque
+from datetime import timedelta
 from functools import wraps
 from hashlib import sha256
 from typing import Any, Callable
@@ -12,24 +13,28 @@ from urllib.parse import urlparse
 
 import paramiko
 from flask import Flask, current_app, jsonify, redirect, render_template, request, session, url_for
-from ollama import Client
+from ollama import Client, RequestError, ResponseError
 from waitress import serve
 
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "").strip()
 OLLAMA_HOST = os.getenv(
     "OLLAMA_HOST",
     "https://ollama.com" if OLLAMA_API_KEY else "http://localhost:11434",
+).strip().rstrip("/")
+OLLAMA_MODEL_DEFAULT = (
+    "gpt-oss:120b" if urlparse(OLLAMA_HOST).hostname == "ollama.com" else "qwen2.5:14b"
 )
 MODEL_NAME = os.getenv(
     "OLLAMA_MODEL",
-    "gpt-oss:120b" if OLLAMA_API_KEY else "hf.co/bartowski/Qwen2.5-14B-Instruct-GGUF:Q4_K_M",
-)
+    OLLAMA_MODEL_DEFAULT,
+).strip()
 ALLOW_VM_COMMANDS = os.getenv("ALLOW_VM_COMMANDS", "").lower() == "true"
 MAX_COMMAND_LENGTH = 2000
 MAX_OUTPUT_LENGTH = 200_000
 MAX_PROMPT_LENGTH = 2000
 LOGIN_ATTEMPT_WINDOW = 15 * 60
 MAX_LOGIN_ATTEMPTS = 5
+DEFAULT_SESSION_IDLE_TIMEOUT_MINUTES = 15
 
 SYSTEM_PROMPT = (
     "You are an assistant for the user's authorized Kali Linux VM. "
@@ -156,6 +161,15 @@ def run_command_in_vm(
 
 
 def create_app(test_config: dict[str, Any] | None = None) -> Flask:
+    try:
+        idle_timeout_minutes = int(
+            os.getenv("SESSION_IDLE_TIMEOUT_MINUTES", str(DEFAULT_SESSION_IDLE_TIMEOUT_MINUTES))
+        )
+    except ValueError as exc:
+        raise RuntimeError("SESSION_IDLE_TIMEOUT_MINUTES must be a positive whole number.") from exc
+    if idle_timeout_minutes < 1:
+        raise RuntimeError("SESSION_IDLE_TIMEOUT_MINUTES must be at least 1.")
+
     app = Flask(__name__)
     app.config.update(
         SECRET_KEY=os.getenv("FLASK_SECRET_KEY", ""),
@@ -163,13 +177,29 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
         SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE", "").lower() == "true",
-        PERMANENT_SESSION_LIFETIME=8 * 60 * 60,
+        SESSION_IDLE_TIMEOUT_MINUTES=idle_timeout_minutes,
+        PERMANENT_SESSION_LIFETIME=timedelta(minutes=idle_timeout_minutes),
         MAX_CONTENT_LENGTH=16 * 1024,
     )
     if test_config:
         app.config.update(test_config)
-    if not app.config["SECRET_KEY"] or not app.config["SITE_PASSWORD"]:
-        raise RuntimeError("Set FLASK_SECRET_KEY and SITE_PASSWORD before starting the website.")
+    app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(
+        minutes=app.config["SESSION_IDLE_TIMEOUT_MINUTES"]
+    )
+    missing_settings = [
+        name
+        for name, value in (
+            ("FLASK_SECRET_KEY", app.config["SECRET_KEY"]),
+            ("SITE_PASSWORD", app.config["SITE_PASSWORD"]),
+        )
+        if not value.strip()
+    ]
+    if missing_settings:
+        missing = ", ".join(missing_settings)
+        raise RuntimeError(
+            f"Missing required environment variable(s): {missing}. "
+            "Add them in your hosting provider's Variables and secrets settings, then restart the container."
+        )
     if urlparse(OLLAMA_HOST).hostname == "ollama.com" and not OLLAMA_API_KEY:
         raise RuntimeError("Set OLLAMA_API_KEY when connecting directly to Ollama Cloud.")
 
@@ -186,6 +216,24 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         supplied = request.headers.get("X-CSRF-Token") if request.is_json else request.form.get("csrf_token")
         expected = session.get("_csrf_token", "")
         return bool(supplied and expected and hmac.compare_digest(supplied, expected))
+
+    @app.before_request
+    def enforce_idle_timeout() -> Any:
+        if not session.get("authenticated"):
+            return None
+
+        now = time.time()
+        last_activity = session.get("_last_activity", now)
+        if not isinstance(last_activity, (int, float)) or now - last_activity >= (
+            app.config["SESSION_IDLE_TIMEOUT_MINUTES"] * 60
+        ):
+            session.clear()
+            if request.path.startswith("/api/"):
+                return jsonify(error="Your session expired due to inactivity. Please sign in again."), 401
+            return redirect(url_for("login", expired=1))
+
+        session["_last_activity"] = now
+        return None
 
     def login_required(view: Callable[..., Any]) -> Callable[..., Any]:
         @wraps(view)
@@ -221,7 +269,8 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     def login() -> Any:
         if session.get("authenticated"):
             return redirect(url_for("index"))
-        return render_template("login.html", error=None)
+        error = "You were signed out due to inactivity. Please sign in again." if request.args.get("expired") else None
+        return render_template("login.html", error=error)
 
     @app.post("/login")
     def login_submit() -> Any:
@@ -245,6 +294,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         session.clear()
         session.permanent = True
         session["authenticated"] = True
+        session["_last_activity"] = time.time()
         csrf_token()
         return redirect(url_for("index"))
 
@@ -256,6 +306,14 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         session.clear()
         return redirect(url_for("login"))
 
+    @app.post("/api/activity")
+    @login_required
+    def activity() -> Any:
+        if not csrf_is_valid():
+            return jsonify(error="Your session expired. Refresh the page and try again."), 400
+        session["_last_activity"] = time.time()
+        return jsonify(ok=True)
+
     @app.get("/")
     @login_required
     def index() -> Any:
@@ -263,6 +321,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             "index.html",
             model_name=MODEL_NAME,
             allow_vm_commands=ALLOW_VM_COMMANDS,
+            idle_timeout_minutes=app.config["SESSION_IDLE_TIMEOUT_MINUTES"],
         )
 
     @app.post("/api/chat")
@@ -287,9 +346,38 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 keep_alive="30m",
                 options={"num_ctx": 4096, "num_predict": 160, "temperature": 0.2},
             )
-        except Exception:
+        except ResponseError as exc:
             current_app.logger.exception("Ollama request failed.")
-            return jsonify(error="The AI service could not complete your request. Check the server configuration."), 502
+            if exc.status_code in (401, 403):
+                message = (
+                    "Ollama rejected authentication. Check the OLLAMA_API_KEY secret if using Ollama Cloud, "
+                    "or verify the endpoint configured in OLLAMA_HOST."
+                )
+            elif exc.status_code == 404:
+                message = (
+                    f'Ollama could not find model "{MODEL_NAME}". Set OLLAMA_MODEL to a model available '
+                    "on the configured Ollama server."
+                )
+            else:
+                detail = exc.error.strip()[:300]
+                message = f"Ollama returned HTTP {exc.status_code}."
+                if detail:
+                    message += f" {detail}"
+            return jsonify(error=message), 502
+        except RequestError:
+            current_app.logger.exception("Could not connect to Ollama.")
+            return jsonify(
+                error=(
+                    "Could not connect to Ollama. Set OLLAMA_HOST to the reachable Ollama server URL "
+                    "(for example, your Railway private service URL or Cloudflare tunnel URL), "
+                    "and confirm that server is running."
+                )
+            ), 502
+        except Exception:
+            current_app.logger.exception("Unexpected Ollama request failure.")
+            return jsonify(
+                error="The AI service failed unexpectedly. Check the application logs for the server-side details."
+            ), 502
         raw_response = response.get("response", "").strip()
         if not raw_response:
             return jsonify(error="The AI returned an empty response."), 502
@@ -362,7 +450,8 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
 def main() -> None:
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
     host = os.getenv("WEB_HOST", "127.0.0.1")
-    port = int(os.getenv("PORT", os.getenv("WEB_PORT", "8000")))
+    port_value = os.getenv("PORT", "").strip() or os.getenv("WEB_PORT", "").strip() or "8080"
+    port = int(port_value)
     serve(create_app(), host=host, port=port, threads=8)
 
 

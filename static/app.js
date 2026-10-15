@@ -4,6 +4,60 @@ const promptInput = document.querySelector("#prompt");
 const sendButton = document.querySelector("#send-button");
 const conversation = document.querySelector("#conversation");
 const welcome = document.querySelector("#welcome");
+const idleTimeoutMinutes = Number(document.querySelector('meta[name="idle-timeout-minutes"]').content);
+const idleTimeoutMs = idleTimeoutMinutes * 60 * 1000;
+const heartbeatMs = 60 * 1000;
+let lastActivityAt = Date.now();
+let lastHeartbeatAt = lastActivityAt;
+let logoutTimer;
+let loggingOut = false;
+
+function signOutForInactivity() {
+  if (loggingOut) return;
+  loggingOut = true;
+  const body = new URLSearchParams({ csrf_token: csrfToken });
+  fetch("/logout", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+    keepalive: true,
+  }).finally(() => {
+    window.location.replace("/login?expired=1");
+  });
+}
+
+function noteActivity() {
+  if (loggingOut) return;
+  lastActivityAt = Date.now();
+  window.clearTimeout(logoutTimer);
+  logoutTimer = window.setTimeout(signOutForInactivity, idleTimeoutMs);
+
+  if (lastActivityAt - lastHeartbeatAt >= heartbeatMs) {
+    lastHeartbeatAt = lastActivityAt;
+    postJson("/api/activity", {}).catch(() => {});
+  }
+}
+
+["pointerdown", "keydown", "scroll", "touchstart"].forEach((eventName) => {
+  document.addEventListener(eventName, noteActivity, { passive: true });
+});
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    if (Date.now() - lastActivityAt >= idleTimeoutMs) signOutForInactivity();
+    else noteActivity();
+  }
+});
+window.setInterval(() => {
+  if (
+    document.visibilityState === "visible" &&
+    Date.now() - lastActivityAt < heartbeatMs &&
+    Date.now() - lastHeartbeatAt >= heartbeatMs
+  ) {
+    lastHeartbeatAt = Date.now();
+    postJson("/api/activity", {}).catch(() => {});
+  }
+}, heartbeatMs);
+logoutTimer = window.setTimeout(signOutForInactivity, idleTimeoutMs);
 
 function addMessage(speaker, text, isUser = false) {
   const article = document.createElement("article");
@@ -35,7 +89,7 @@ async function postJson(path, payload) {
     body: JSON.stringify(payload),
   });
   if (response.status === 401) {
-    window.location.assign("/login");
+    window.location.assign("/login?expired=1");
     throw new Error("Your session ended. Sign in again.");
   }
   const result = await response.json();
