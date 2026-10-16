@@ -23,11 +23,17 @@ OLLAMA_HOST = os.getenv(
 ).strip().rstrip("/")
 OLLAMA_HOSTNAME = urlparse(OLLAMA_HOST).hostname
 IS_OFFICIAL_OLLAMA_CLOUD = OLLAMA_HOSTNAME == "ollama.com"
-OLLAMA_MODEL_DEFAULT = "gpt-oss:120b" if IS_OFFICIAL_OLLAMA_CLOUD else "qwen2.5:14b"
+OLLAMA_MODEL_DEFAULT = "hermes3"
 MODEL_NAME = os.getenv(
     "OLLAMA_MODEL",
     OLLAMA_MODEL_DEFAULT,
 ).strip()
+configured_models = [
+    model.strip()
+    for model in os.getenv("OLLAMA_MODELS", "hermes3,qwen2.5:14b").split(",")
+    if model.strip()
+]
+AVAILABLE_MODELS = tuple(dict.fromkeys([MODEL_NAME, *configured_models]))
 ALLOW_VM_COMMANDS = os.getenv("ALLOW_VM_COMMANDS", "").lower() == "true"
 MAX_COMMAND_LENGTH = 2000
 MAX_OUTPUT_LENGTH = 200_000
@@ -324,6 +330,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         return render_template(
             "index.html",
             model_name=MODEL_NAME,
+            available_models=AVAILABLE_MODELS,
             allow_vm_commands=ALLOW_VM_COMMANDS,
             idle_timeout_minutes=app.config["SESSION_IDLE_TIMEOUT_MINUTES"],
         )
@@ -335,15 +342,18 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             return jsonify(error="Your session expired. Refresh the page and try again."), 400
         payload = request.get_json(silent=True)
         prompt = payload.get("prompt") if isinstance(payload, dict) else None
+        model = payload.get("model", MODEL_NAME) if isinstance(payload, dict) else MODEL_NAME
         if not isinstance(prompt, str) or not prompt.strip():
             return jsonify(error="Enter a message first."), 400
         prompt = prompt.strip()
         if len(prompt) > MAX_PROMPT_LENGTH:
             return jsonify(error=f"Messages must be {MAX_PROMPT_LENGTH} characters or fewer."), 400
+        if not isinstance(model, str) or model not in AVAILABLE_MODELS:
+            return jsonify(error="Choose one of the configured Ollama models."), 400
 
         try:
             response = create_ollama_client().generate(
-                model=MODEL_NAME,
+                model=model,
                 system=SYSTEM_PROMPT,
                 prompt=prompt,
                 stream=False,
@@ -366,7 +376,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                     message += f" Server response: {detail}"
             elif exc.status_code == 404:
                 message = (
-                    f'Ollama could not find model "{MODEL_NAME}". Set OLLAMA_MODEL to a model available '
+                    f'Ollama could not find model "{model}". Set OLLAMA_MODELS to models available '
                     "on the configured Ollama server."
                 )
             else:
