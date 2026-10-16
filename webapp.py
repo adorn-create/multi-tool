@@ -17,30 +17,35 @@ from ollama import Client, RequestError, ResponseError
 from waitress import serve
 
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "").strip()
+CF_ACCESS_CLIENT_ID = os.getenv("CF_ACCESS_CLIENT_ID", "").strip()
+CF_ACCESS_CLIENT_SECRET = os.getenv("CF_ACCESS_CLIENT_SECRET", "").strip()
 OLLAMA_HOST = os.getenv(
     "OLLAMA_HOST",
     "https://ollama.com" if OLLAMA_API_KEY else "http://localhost:11434",
 ).strip().rstrip("/")
 OLLAMA_HOSTNAME = urlparse(OLLAMA_HOST).hostname
 IS_OFFICIAL_OLLAMA_CLOUD = OLLAMA_HOSTNAME == "ollama.com"
-OLLAMA_MODEL_DEFAULT = "hermes3"
-MODEL_NAME = os.getenv(
-    "OLLAMA_MODEL",
-    OLLAMA_MODEL_DEFAULT,
-).strip()
-configured_models = [
-    model.strip()
-    for model in os.getenv("OLLAMA_MODELS", "hermes3,qwen2.5:14b").split(",")
-    if model.strip()
-]
-AVAILABLE_MODELS = tuple(dict.fromkeys([MODEL_NAME, *configured_models]))
+MODEL_NAMES = ("hermes3", "qwen2.5:14b")
+MODEL_LABEL = " + ".join(MODEL_NAMES)
 ALLOW_VM_COMMANDS = os.getenv("ALLOW_VM_COMMANDS", "").lower() == "true"
+ALLOW_TOOL_INSTALLS = os.getenv("ALLOW_TOOL_INSTALLS", "").lower() == "true"
 MAX_COMMAND_LENGTH = 2000
 MAX_OUTPUT_LENGTH = 200_000
 MAX_PROMPT_LENGTH = 2000
+MAX_VM_COMMAND_TIMEOUT_SECONDS = 600
 LOGIN_ATTEMPT_WINDOW = 15 * 60
 MAX_LOGIN_ATTEMPTS = 5
 DEFAULT_SESSION_IDLE_TIMEOUT_MINUTES = 15
+KALI_TOOL_CATALOG = {
+    "nmap": "Network discovery and service checks for systems you are authorized to test.",
+    "tcpdump": "Capture and inspect network traffic on your VM.",
+    "wireshark": "Analyze packet captures and network protocols.",
+    "dnsutils": "DNS lookup utilities such as dig and nslookup.",
+    "whois": "Look up domain registration information.",
+    "net-tools": "Legacy network utilities such as ifconfig and netstat.",
+    "git": "Clone and manage source code repositories.",
+    "python3-venv": "Create isolated Python virtual environments.",
+}
 
 SYSTEM_PROMPT = (
     "You are an assistant for the user's authorized Kali Linux VM. "
@@ -51,6 +56,13 @@ SYSTEM_PROMPT = (
     "Use action=chat for ordinary questions. Never claim a command ran when it did not. "
     "Keep chat replies concise, usually one to three sentences. Keep command explanations brief. "
     "Only provide commands for systems the user owns or is authorized to administer."
+)
+SYNTHESIS_SYSTEM_PROMPT = (
+    "You combine two independent assistant responses into one concise answer for the user. "
+    "Return exactly one JSON object in this form: "
+    '{"action":"chat","message":"your unified reply"}. '
+    "Never provide or change a terminal command. If the responses disagree about a command, "
+    "explain the disagreement and say no command will be run."
 )
 
 
@@ -79,12 +91,34 @@ def parse_ai_response(response_text: str) -> tuple[str, str, str]:
     return action, message, command
 
 
-def create_ollama_client() -> Client:
-    headers = (
-        {"Authorization": f"Bearer {OLLAMA_API_KEY}"}
-        if OLLAMA_API_KEY and IS_OFFICIAL_OLLAMA_CLOUD
-        else {}
+def generate_model_response(
+    client: Client,
+    model: str,
+    system: str,
+    prompt: str,
+) -> tuple[str, str, str]:
+    response = client.generate(
+        model=model,
+        system=system,
+        prompt=prompt,
+        stream=False,
+        keep_alive="0",
+        options={"num_ctx": 4096, "num_predict": 300, "temperature": 0.2},
     )
+    raw_response = response.get("response", "").strip()
+    if not raw_response:
+        raise ValueError(f'Ollama model "{model}" returned an empty response.')
+    return parse_ai_response(raw_response)
+
+
+def create_ollama_client() -> Client:
+    headers: dict[str, str] = {}
+    if IS_OFFICIAL_OLLAMA_CLOUD:
+        if OLLAMA_API_KEY:
+            headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
+    elif CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET:
+        headers["CF-Access-Client-Id"] = CF_ACCESS_CLIENT_ID
+        headers["CF-Access-Client-Secret"] = CF_ACCESS_CLIENT_SECRET
     return Client(host=OLLAMA_HOST, headers=headers)
 
 
@@ -95,10 +129,15 @@ def run_command_in_vm(
     command: str,
     key_filename: str = "",
     key_passphrase: str = "",
+    timeout_seconds: int = 60,
 ) -> str:
     """Run a command only on a VM whose SSH host key is already trusted."""
     if not host.strip() or not username.strip():
         raise ValueError("Set KALI_VM_IP and KALI_VM_USER before running VM commands.")
+    if not 1 <= timeout_seconds <= MAX_VM_COMMAND_TIMEOUT_SECONDS:
+        raise ValueError(
+            f"VM command timeout must be between 1 and {MAX_VM_COMMAND_TIMEOUT_SECONDS} seconds."
+        )
 
     ssh = paramiko.SSHClient()
     ssh.load_system_host_keys()
@@ -119,18 +158,20 @@ def run_command_in_vm(
             allow_agent=False,
             look_for_keys=False,
         )
-        _, stdout, _ = ssh.exec_command(command, timeout=60)
+        _, stdout, _ = ssh.exec_command(command, timeout=timeout_seconds)
         channel = stdout.channel
         output = bytearray()
         error = bytearray()
         output_truncated = False
         error_truncated = False
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + timeout_seconds
 
         while not channel.exit_status_ready() or channel.recv_ready() or channel.recv_stderr_ready():
             if time.monotonic() >= deadline:
                 channel.close()
-                raise TimeoutError("The VM command exceeded the 60-second limit.")
+                raise TimeoutError(
+                    f"The VM command exceeded the {timeout_seconds}-second limit."
+                )
             received_data = False
             if channel.recv_ready():
                 chunk = channel.recv(32_768)
@@ -209,6 +250,11 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         raise RuntimeError(
             f"Missing required environment variable(s): {missing}. "
             "Add them in your hosting provider's Variables and secrets settings, then restart the container."
+        )
+    if bool(CF_ACCESS_CLIENT_ID) != bool(CF_ACCESS_CLIENT_SECRET):
+        raise RuntimeError(
+            "Set both CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET, or remove both, "
+            "to configure Cloudflare Access service authentication."
         )
     if urlparse(OLLAMA_HOST).hostname == "ollama.com" and not OLLAMA_API_KEY:
         raise RuntimeError("Set OLLAMA_API_KEY when connecting directly to Ollama Cloud.")
@@ -327,11 +373,22 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     @app.get("/")
     @login_required
     def index() -> Any:
+        csrf = csrf_token()
+        tool_confirmations = {
+            package: hmac.new(
+                app.config["SECRET_KEY"].encode("utf-8"),
+                f"{csrf}:install:{package}".encode("utf-8"),
+                sha256,
+            ).hexdigest()
+            for package in KALI_TOOL_CATALOG
+        } if ALLOW_TOOL_INSTALLS else {}
         return render_template(
             "index.html",
-            model_name=MODEL_NAME,
-            available_models=AVAILABLE_MODELS,
+            model_name=MODEL_LABEL,
             allow_vm_commands=ALLOW_VM_COMMANDS,
+            allow_tool_installs=ALLOW_TOOL_INSTALLS,
+            tool_catalog=KALI_TOOL_CATALOG if ALLOW_TOOL_INSTALLS else {},
+            tool_confirmations=tool_confirmations,
             idle_timeout_minutes=app.config["SESSION_IDLE_TIMEOUT_MINUTES"],
         )
 
@@ -342,24 +399,57 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             return jsonify(error="Your session expired. Refresh the page and try again."), 400
         payload = request.get_json(silent=True)
         prompt = payload.get("prompt") if isinstance(payload, dict) else None
-        model = payload.get("model", MODEL_NAME) if isinstance(payload, dict) else MODEL_NAME
         if not isinstance(prompt, str) or not prompt.strip():
             return jsonify(error="Enter a message first."), 400
         prompt = prompt.strip()
         if len(prompt) > MAX_PROMPT_LENGTH:
             return jsonify(error=f"Messages must be {MAX_PROMPT_LENGTH} characters or fewer."), 400
-        if not isinstance(model, str) or model not in AVAILABLE_MODELS:
-            return jsonify(error="Choose one of the configured Ollama models."), 400
 
         try:
-            response = create_ollama_client().generate(
-                model=model,
-                system=SYSTEM_PROMPT,
-                prompt=prompt,
-                stream=False,
-                keep_alive="30m",
-                options={"num_ctx": 4096, "num_predict": 160, "temperature": 0.2},
+            client = create_ollama_client()
+            model_responses = [
+                (
+                    model,
+                    generate_model_response(client, model, SYSTEM_PROMPT, prompt),
+                )
+                for model in MODEL_NAMES
+            ]
+            synthesis_prompt = json.dumps(
+                {
+                    "user_request": prompt,
+                    "model_responses": [
+                        {
+                            "model": model,
+                            "action": response[0],
+                            "message": response[1],
+                            "command": response[2] if response[0] == "command" else "",
+                        }
+                        for model, response in model_responses
+                    ],
+                }
             )
+            synthesis_action, message, _ = generate_model_response(
+                client,
+                MODEL_NAMES[0],
+                SYNTHESIS_SYSTEM_PROMPT,
+                synthesis_prompt,
+            )
+            if synthesis_action != "chat":
+                raise ValueError("The synthesis response must be a chat message.")
+
+            proposed_commands = [
+                response[2] for _, response in model_responses if response[0] == "command"
+            ]
+            command = ""
+            action = "chat"
+            if (
+                len(proposed_commands) == len(MODEL_NAMES)
+                and all(candidate == proposed_commands[0] for candidate in proposed_commands)
+            ):
+                action = "command"
+                command = proposed_commands[0]
+            elif proposed_commands:
+                message += "\n\nThe models disagreed on a command, so no command will be run."
         except ResponseError as exc:
             current_app.logger.exception("Ollama request failed.")
             if exc.status_code in (401, 403):
@@ -370,14 +460,18 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 else:
                     message = (
                         f"The configured Ollama endpoint ({host}) rejected authentication. "
-                        "Check whether the Railway service or tunnel requires its own access credentials."
+                        "If this tunnel is protected by Cloudflare Access, add a service token using "
+                        "CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET in the hosting secrets. "
+                        "Otherwise check the Ollama server or proxy's authentication settings."
                     )
                 if detail:
                     message += f" Server response: {detail}"
             elif exc.status_code == 404:
+                missing_models = ", ".join(MODEL_NAMES)
                 message = (
-                    f'Ollama could not find model "{model}". Set OLLAMA_MODELS to models available '
-                    "on the configured Ollama server."
+                    f"Ollama could not find one of the required models ({missing_models}). "
+                    "Pull both models on the Ollama server with `ollama pull hermes3` and "
+                    "`ollama pull qwen2.5:14b`."
                 )
             else:
                 detail = exc.error.strip()[:300]
@@ -385,6 +479,14 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 if detail:
                     message += f" {detail}"
             return jsonify(error=message), 502
+        except (ValueError, json.JSONDecodeError):
+            current_app.logger.exception("An Ollama model returned an invalid response.")
+            return jsonify(
+                error=(
+                    "An Ollama model returned a response in an unexpected format. "
+                    "Check that every configured model supports the assistant's required JSON response format."
+                )
+            ), 502
         except RequestError:
             current_app.logger.exception("Could not connect to Ollama.")
             return jsonify(
@@ -399,14 +501,6 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             return jsonify(
                 error="The AI service failed unexpectedly. Check the application logs for the server-side details."
             ), 502
-        raw_response = response.get("response", "").strip()
-        if not raw_response:
-            return jsonify(error="The AI returned an empty response."), 502
-        try:
-            action, message, command = parse_ai_response(raw_response)
-        except (ValueError, json.JSONDecodeError) as exc:
-            current_app.logger.warning("Could not parse the AI response: %s", exc)
-            return jsonify(error="The AI returned a response that could not be processed."), 502
 
         result: dict[str, str] = {"action": action, "message": message or "(no response text)"}
         if action == "command":
@@ -464,6 +558,67 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             current_app.logger.exception("VM command failed.")
             return jsonify(error="The VM command failed. Check server logs and VM configuration."), 502
         return jsonify(result=result)
+
+    @app.post("/api/tools/install")
+    @login_required
+    def install_tool() -> Any:
+        if not ALLOW_TOOL_INSTALLS:
+            return jsonify(error="VM tool installation is disabled on this website."), 403
+        if not csrf_is_valid():
+            return jsonify(error="Your session expired. Refresh the page and try again."), 400
+
+        payload = request.get_json(silent=True)
+        package = payload.get("package") if isinstance(payload, dict) else None
+        confirmation = payload.get("confirmation") if isinstance(payload, dict) else None
+        if not isinstance(package, str) or package not in KALI_TOOL_CATALOG:
+            return jsonify(error="Choose a tool from the supported Kali package catalog."), 400
+        if not isinstance(confirmation, str):
+            return jsonify(error="Confirm this tool installation from the website first."), 400
+
+        expected_confirmation = hmac.new(
+            app.config["SECRET_KEY"].encode("utf-8"),
+            f'{session.get("_csrf_token", "")}:install:{package}'.encode("utf-8"),
+            sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(confirmation, expected_confirmation):
+            return jsonify(error="This installation was not confirmed for your current session."), 400
+
+        command = (
+            "sudo -n apt-get update && "
+            f"sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y "
+            f"--no-install-recommends -- {package}"
+        )
+        try:
+            result = run_command_in_vm(
+                os.getenv("KALI_VM_IP", ""),
+                os.getenv("KALI_VM_USER", ""),
+                os.getenv("KALI_VM_PASS", ""),
+                command,
+                os.getenv("KALI_SSH_KEY", ""),
+                os.getenv("KALI_SSH_KEY_PASSPHRASE", ""),
+                timeout_seconds=MAX_VM_COMMAND_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            current_app.logger.exception("Kali package installation failed.")
+            return jsonify(
+                error=(
+                    "The tool installation failed. Check the VM SSH configuration, package "
+                    "repositories, network access, and passwordless sudo permissions."
+                )
+            ), 502
+        if not result.startswith("Exit code: 0\n"):
+            current_app.logger.warning(
+                "APT installation of allowlisted package %s failed: %s",
+                package,
+                result[:1000],
+            )
+            return jsonify(
+                error=(
+                    f"APT could not install {package}. Check the VM's Kali APT repositories, "
+                    "permissions, and network access."
+                )
+            ), 502
+        return jsonify(package=package, result=result)
 
     return app
 
