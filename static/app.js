@@ -1,9 +1,10 @@
 const csrfToken = document.querySelector('meta[name="csrf-token"]').content;
-const form = document.querySelector("#chat-form");
+const form = document.querySelector("#task-form");
 const promptInput = document.querySelector("#prompt");
+const authorizedInput = document.querySelector("#authorized");
 const sendButton = document.querySelector("#send-button");
-const conversation = document.querySelector("#conversation");
-const welcome = document.querySelector("#welcome");
+const taskMessage = document.querySelector("#task-message");
+const boardMessage = document.querySelector("#board-message");
 const idleTimeoutMinutes = Number(document.querySelector('meta[name="idle-timeout-minutes"]').content);
 const idleTimeoutMs = idleTimeoutMinutes * 60 * 1000;
 const heartbeatMs = 60 * 1000;
@@ -11,6 +12,15 @@ let lastActivityAt = Date.now();
 let lastHeartbeatAt = lastActivityAt;
 let logoutTimer;
 let loggingOut = false;
+let boardLoading = false;
+
+const taskColumns = [
+  { statuses: ["triage"], list: document.querySelector("#tasks-triage") },
+  { statuses: ["todo", "ready"], list: document.querySelector("#tasks-queued") },
+  { statuses: ["running"], list: document.querySelector("#tasks-running") },
+  { statuses: ["blocked", "review"], list: document.querySelector("#tasks-review") },
+  { statuses: ["done", "archived"], list: document.querySelector("#tasks-done") },
+];
 
 function signOutForInactivity() {
   if (loggingOut) return;
@@ -59,29 +69,6 @@ window.setInterval(() => {
 }, heartbeatMs);
 logoutTimer = window.setTimeout(signOutForInactivity, idleTimeoutMs);
 
-function addMessage(speaker, text, isUser = false) {
-  const article = document.createElement("article");
-  article.className = `message ${isUser ? "user" : "assistant"}`;
-
-  const label = document.createElement("p");
-  label.className = "message-label";
-  label.textContent = speaker;
-  const body = document.createElement("div");
-  body.className = "message-body";
-  body.textContent = text;
-  article.append(label, body);
-  conversation.append(article);
-  article.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  return { article, body };
-}
-
-function showError(container, message) {
-  const error = document.createElement("p");
-  error.className = "result-output error-text";
-  error.textContent = message;
-  container.append(error);
-}
-
 async function postJson(path, payload) {
   const response = await fetch(path, {
     method: "POST",
@@ -97,113 +84,111 @@ async function postJson(path, payload) {
   return result;
 }
 
-async function askAssistant(prompt) {
-  welcome.hidden = true;
-  const userMessage = addMessage("YOU", prompt, true);
-  const assistant = addMessage("NIGASH", "Thinking…");
-  sendButton.disabled = true;
-  try {
-    const result = await postJson("/api/chat", { prompt });
-    assistant.body.textContent = result.message;
-    if (result.action === "command") {
-      const card = document.createElement("section");
-      card.className = "command-card";
-      const title = document.createElement("p");
-      title.className = "command-title";
-      title.textContent = "Review before running";
-      const command = document.createElement("pre");
-      command.className = "command-preview";
-      command.textContent = `$ ${result.command}`;
-      const button = document.createElement("button");
-      button.className = "run-button";
-      button.type = "button";
-      button.textContent = "Run on my VM";
-      card.append(title, command, button);
-      assistant.body.append(card);
+function showTask(task, list) {
+  const card = document.createElement("article");
+  card.className = "task-card";
 
-      button.addEventListener("click", async () => {
-        if (!window.confirm(`Run this command on your configured Kali VM?\n\n${result.command}`)) return;
-        button.disabled = true;
-        button.textContent = "Running…";
-        try {
-          const execution = await postJson("/api/execute", {
-            command: result.command,
-            confirmation: result.confirmation,
-          });
-          const output = document.createElement("pre");
-          output.className = "result-output";
-          output.textContent = execution.result;
-          card.append(output);
-          button.remove();
-        } catch (error) {
-          button.disabled = false;
-          button.textContent = "Retry command";
-          showError(card, error.message);
-        }
-      });
+  const heading = document.createElement("h4");
+  heading.textContent = task.title;
+  const status = document.createElement("span");
+  status.className = `task-status status-${task.status}`;
+  status.textContent = task.status.replaceAll("_", " ");
+  const assignee = document.createElement("p");
+  assignee.className = "task-assignee";
+  assignee.textContent = task.assignee ? `Assigned to ${task.assignee}` : "Waiting for assignment";
+  card.append(heading, status, assignee);
+
+  if (typeof task.result === "string" && task.result.trim()) {
+    const result = document.createElement("p");
+    result.className = "task-result";
+    result.textContent = task.result.trim();
+    card.append(result);
+  }
+  list.append(card);
+}
+
+function renderBoard(tasks) {
+  taskColumns.forEach(({ list }) => list.replaceChildren());
+  const counts = new Map(taskColumns.map(({ list }) => [list, 0]));
+
+  tasks.forEach((task) => {
+    const column = taskColumns.find(({ statuses }) => statuses.includes(task.status));
+    if (!column) throw new Error(`Hermes returned an unsupported task status: ${task.status}`);
+    showTask(task, column.list);
+    counts.set(column.list, counts.get(column.list) + 1);
+  });
+
+  taskColumns.forEach(({ list }) => {
+    list.closest(".kanban-column").querySelector(".column-count").textContent = counts.get(list);
+    if (!list.childElementCount) {
+      const empty = document.createElement("p");
+      empty.className = "empty-column";
+      empty.textContent = "No tasks here";
+      list.append(empty);
     }
+  });
+}
+
+async function loadBoard() {
+  if (boardLoading) return;
+  boardLoading = true;
+  boardMessage.textContent = "Syncing with the local Hermes board…";
+  boardMessage.className = "board-message";
+  try {
+    const response = await fetch("/api/team", { headers: { Accept: "application/json" } });
+    if (response.status === 401) {
+      window.location.assign("/login?expired=1");
+      throw new Error("Your session ended. Sign in again.");
+    }
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "The team board could not be loaded.");
+    if (!Array.isArray(result.tasks)) throw new Error("Hermes returned an unexpected task list.");
+    renderBoard(result.tasks);
+    boardMessage.textContent = `Synced ${result.tasks.length} task${result.tasks.length === 1 ? "" : "s"}.`;
   } catch (error) {
-    assistant.body.textContent = "";
-    showError(assistant.body, error.message);
+    boardMessage.textContent = error.message;
+    boardMessage.className = "board-message error-text";
   } finally {
-    sendButton.disabled = false;
-    promptInput.focus();
+    boardLoading = false;
   }
 }
 
-form.addEventListener("submit", (event) => {
+form.addEventListener("submit", async (event) => {
   event.preventDefault();
   const prompt = promptInput.value.trim();
-  if (!prompt || sendButton.disabled) return;
-  promptInput.value = "";
-  promptInput.style.height = "auto";
-  askAssistant(prompt);
+  if (!prompt || !authorizedInput.checked || sendButton.disabled) {
+    form.reportValidity();
+    return;
+  }
+
+  sendButton.disabled = true;
+  sendButton.textContent = "Adding task…";
+  taskMessage.className = "form-note";
+  taskMessage.textContent = "Sending the task to Hermes Kanban…";
+  try {
+    const result = await postJson("/api/team/tasks", { prompt, authorized: true });
+    promptInput.value = "";
+    promptInput.style.height = "auto";
+    authorizedInput.checked = false;
+    taskMessage.textContent = `Task ${result.task.id} added to triage.`;
+    await loadBoard();
+  } catch (error) {
+    taskMessage.textContent = error.message;
+    taskMessage.className = "form-note error-text";
+  } finally {
+    sendButton.disabled = false;
+    sendButton.innerHTML = 'Add to team queue <span aria-hidden="true">↗</span>';
+    promptInput.focus();
+  }
 });
 
 promptInput.addEventListener("input", () => {
   promptInput.style.height = "auto";
-  promptInput.style.height = `${Math.min(promptInput.scrollHeight, 160)}px`;
+  promptInput.style.height = `${Math.min(promptInput.scrollHeight, 180)}px`;
 });
 
-promptInput.addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && !event.shiftKey) {
-    event.preventDefault();
-    form.requestSubmit();
-  }
-});
-
-document.querySelectorAll(".suggestion").forEach((button) => {
-  button.addEventListener("click", () => {
-    promptInput.value = button.dataset.prompt;
-    form.requestSubmit();
-  });
-});
-
-document.querySelectorAll(".install-tool-button").forEach((button) => {
-  button.addEventListener("click", async () => {
-    const packageName = button.dataset.package;
-    if (!window.confirm(
-      `Install ${packageName} from the Kali APT repositories on your configured VM? ` +
-      "This runs apt-get update and requires passwordless sudo."
-    )) return;
-
-    button.disabled = true;
-    button.textContent = "Installing…";
-    const card = button.closest(".tool-card");
-    try {
-      const result = await postJson("/api/tools/install", {
-        package: packageName,
-        confirmation: button.dataset.confirmation,
-      });
-      const output = document.createElement("pre");
-      output.className = "result-output";
-      output.textContent = result.result;
-      card.append(output);
-      button.textContent = "Finished";
-    } catch (error) {
-      button.disabled = false;
-      button.textContent = "Retry install";
-      showError(card, error.message);
-    }
-  });
-});
+document.querySelector("#refresh-board").addEventListener("click", loadBoard);
+window.setInterval(() => {
+  if (document.visibilityState === "visible") loadBoard();
+}, 15000);
+loadBoard();

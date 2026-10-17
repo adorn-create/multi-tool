@@ -6,40 +6,109 @@
   <meta name="color-scheme" content="dark">
   <meta name="csrf-token" content="{{ csrf_token() }}">
   <meta name="idle-timeout-minutes" content="{{ idle_timeout_minutes }}">
-  <title>Arnav &amp; Abh</title>
+  <title>Kali AI Security Team</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
   <script src="{{ url_for('static', filename='app.js') }}" defer></script>
 </head>
 <body>
   <div class="app-shell">
     <header class="topbar">
-      <div class="profile-panel" aria-label="Current user profile">
-        <div class="user-label">YOU</div>
-        <div class="user-avatar">hi</div>
-      </div>
-      <div class="user-name" aria-label="Username">Arnav &amp;Abh</div>
+      <a class="brand" href="/" aria-label="Kali AI Security Team home">
+        <span class="brand-mark" aria-hidden="true">K</span>
+        <span>
+          <span class="brand-name">KALI / TEAM OPS</span>
+          <span class="brand-subtitle">LOCAL HERMES AGENTS</span>
+        </span>
+      </a>
+      <div class="local-status"><span class="status-dot"></span>Connected to {{ kanban_board }}</div>
     </header>
 
     <main class="workspace">
-      <section class="welcome" id="welcome" hidden></section>
-
-      <section class="conversation" id="conversation" aria-live="polite" aria-label="Conversation">
-        <article class="message assistant">
-          <p class="message-label">NIGASH</p>
-          <div class="message-body">
-            The configured Ollama endpoint (valley-trials-allowed-single.trycloudflare.com) rejected authentication. If this tunnel is protected by Cloudflare Access, add a service token using CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET in the hosting secrets. Otherwise check the Ollama server or proxy's authentication settings.
-          </div>
-        </article>
+      <section class="page-heading">
+        <div>
+          <p class="eyebrow">HERMES AGENT · KANBAN</p>
+          <h1>Your security team</h1>
+          <p class="page-description">Delegate authorized assessment work to your local Kali team and follow every handoff.</p>
+        </div>
+        <div class="live-indicator"><span class="status-dot"></span>LIVE BOARD</div>
       </section>
 
-      <div class="composer-wrap">
-        <form class="composer" id="chat-form">
-          <label class="sr-only" for="prompt">Message Nigash</label>
-          <textarea id="prompt" rows="1" maxlength="2000" placeholder="Message Nigash..." required></textarea>
-          <button class="send-button" id="send-button" type="submit" aria-label="Send message">↑</button>
+      <section class="team-panel" aria-labelledby="team-heading">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">SPECIALISTS</p>
+            <h2 id="team-heading">Your agent roster</h2>
+          </div>
+          <span class="section-note">Hermes profiles · {{ team_agents|length }} agents</span>
+        </div>
+        <div class="agent-grid">
+          {% for agent in team_agents %}
+          <article class="agent-card">
+            <div class="agent-avatar" aria-hidden="true">{{ agent.title[0] }}</div>
+            <div class="agent-copy">
+              <h3>{{ agent.title }}</h3>
+              <p>{{ agent.role }}</p>
+              <span class="profile-name">{{ agent.profile }}</span>
+            </div>
+          </article>
+          {% endfor %}
+        </div>
+      </section>
+
+      <section class="task-panel" aria-labelledby="new-task-heading">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">NEW ASSIGNMENT</p>
+            <h2 id="new-task-heading">Send work to the team</h2>
+          </div>
+        </div>
+        <form class="task-form" id="task-form">
+          <label class="sr-only" for="prompt">Assessment request</label>
+          <textarea id="prompt" rows="3" maxlength="2000" placeholder="Describe your authorized Kali lab assessment, including target scope and what you want reviewed." required></textarea>
+          <div class="task-form-footer">
+            <label class="authorization-check">
+              <input id="authorized" type="checkbox" required>
+              <span>I own this target or have permission to assess it, and the requested scope is authorized.</span>
+            </label>
+            <button class="send-button" id="send-button" type="submit">Add to team queue <span aria-hidden="true">↗</span></button>
+          </div>
         </form>
-        <div class="composer-note">AI can make mistakes. Review every command before it runs.</div>
-      </div>
+        <p class="form-note" id="task-message" role="status" aria-live="polite">Tasks enter triage first. The lead can split work across specialists.</p>
+      </section>
+
+      <section class="board-section" aria-labelledby="board-heading">
+        <div class="section-heading board-heading">
+          <div>
+            <p class="eyebrow">DURABLE WORK QUEUE</p>
+            <h2 id="board-heading">Team board</h2>
+          </div>
+          <button class="refresh-button" id="refresh-board" type="button" aria-label="Refresh team board">Refresh <span aria-hidden="true">↻</span></button>
+        </div>
+        <div class="board-message" id="board-message" role="status" aria-live="polite"></div>
+        <div class="kanban-board" id="team-board" aria-label="Hermes Kanban tasks">
+          <section class="kanban-column" data-status-group="triage">
+            <header><h3>Triage</h3><span class="column-count">0</span></header>
+            <div class="task-list" id="tasks-triage"></div>
+          </section>
+          <section class="kanban-column" data-status-group="todo,ready">
+            <header><h3>Queued</h3><span class="column-count">0</span></header>
+            <div class="task-list" id="tasks-queued"></div>
+          </section>
+          <section class="kanban-column" data-status-group="running">
+            <header><h3>In progress</h3><span class="column-count">0</span></header>
+            <div class="task-list" id="tasks-running"></div>
+          </section>
+          <section class="kanban-column" data-status-group="blocked,review">
+            <header><h3>Needs review</h3><span class="column-count">0</span></header>
+            <div class="task-list" id="tasks-review"></div>
+          </section>
+          <section class="kanban-column" data-status-group="done">
+            <header><h3>Completed</h3><span class="column-count">0</span></header>
+            <div class="task-list" id="tasks-done"></div>
+          </section>
+        </div>
+      </section>
+      <p class="safety-note">Use only on systems you own or are authorized to test. Keep the web app private; Hermes agents run with the permissions configured in their local profiles.</p>
     </main>
   </div>
 </body>

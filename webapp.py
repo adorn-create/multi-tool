@@ -2,152 +2,95 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
+import shlex
 import time
 from collections import defaultdict, deque
 from datetime import timedelta
 from functools import wraps
-from hashlib import sha256
 from typing import Any, Callable
-from urllib.parse import urlparse
 
 import paramiko
 from flask import Flask, current_app, jsonify, redirect, render_template, request, session, url_for
-from ollama import Client, RequestError, ResponseError
 from waitress import serve
 
-OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "").strip()
-CF_ACCESS_CLIENT_ID = os.getenv("CF_ACCESS_CLIENT_ID", "").strip()
-CF_ACCESS_CLIENT_SECRET = os.getenv("CF_ACCESS_CLIENT_SECRET", "").strip()
-OLLAMA_HOST = os.getenv(
-    "OLLAMA_HOST",
-    "https://ollama.com" if OLLAMA_API_KEY else "http://localhost:11434",
-).strip().rstrip("/")
-OLLAMA_HOSTNAME = urlparse(OLLAMA_HOST).hostname
-IS_OFFICIAL_OLLAMA_CLOUD = OLLAMA_HOSTNAME == "ollama.com"
-MODEL_NAMES = ("hermes3", "qwen2.5:14b")
-MODEL_LABEL = " + ".join(MODEL_NAMES)
-ALLOW_VM_COMMANDS = os.getenv("ALLOW_VM_COMMANDS", "").lower() == "true"
-ALLOW_TOOL_INSTALLS = os.getenv("ALLOW_TOOL_INSTALLS", "").lower() == "true"
-MAX_COMMAND_LENGTH = 2000
-MAX_OUTPUT_LENGTH = 200_000
 MAX_PROMPT_LENGTH = 2000
-MAX_VM_COMMAND_TIMEOUT_SECONDS = 600
 LOGIN_ATTEMPT_WINDOW = 15 * 60
 MAX_LOGIN_ATTEMPTS = 5
 DEFAULT_SESSION_IDLE_TIMEOUT_MINUTES = 15
-KALI_TOOL_CATALOG = {
-    "nmap": "Network discovery and service checks for systems you are authorized to test.",
-    "tcpdump": "Capture and inspect network traffic on your VM.",
-    "wireshark": "Analyze packet captures and network protocols.",
-    "dnsutils": "DNS lookup utilities such as dig and nslookup.",
-    "whois": "Look up domain registration information.",
-    "net-tools": "Legacy network utilities such as ifconfig and netstat.",
-    "git": "Clone and manage source code repositories.",
-    "python3-venv": "Create isolated Python virtual environments.",
-}
-
-SYSTEM_PROMPT = (
-    "You are Nigash, an assistant for the user's authorized Kali Linux VM. "
-    "Return exactly one JSON object, without markdown, in one of these forms: "
-    '{"action":"chat","message":"your reply"} or '
-    '{"action":"command","command":"one shell command","message":"brief explanation"}. '
-    "Use action=command only when the user's request requires running a terminal command. "
-    "Use action=chat for ordinary questions. Never claim a command ran when it did not. "
-    "Keep chat replies concise, usually one to three sentences. Keep command explanations brief. "
-    "Only provide commands for systems the user owns or is authorized to administer."
+HERMES_CLI = os.getenv("HERMES_CLI", "hermes").strip()
+HERMES_KANBAN_BOARD = os.getenv("HERMES_KANBAN_BOARD", "default").strip()
+HERMES_TEAM_LEAD_PROFILE = os.getenv("HERMES_TEAM_LEAD_PROFILE", "security-lead").strip()
+HERMES_COMMAND_TIMEOUT_SECONDS = 30
+MAX_HERMES_OUTPUT_BYTES = 1_000_000
+HERMES_KANBAN_STATUSES = frozenset(
+    {"triage", "todo", "ready", "running", "blocked", "review", "done", "archived"}
 )
-SYNTHESIS_SYSTEM_PROMPT = (
-    "You are Nigash. Combine two independent assistant responses into one concise answer for the user. "
-    "Return exactly one JSON object in this form: "
-    '{"action":"chat","message":"your unified reply"}. '
-    "Never provide or change a terminal command. If the responses disagree about a command, "
-    "explain the disagreement and say no command will be run."
+HERMES_TEAM_AGENTS = (
+    {
+        "profile": "security-lead",
+        "title": "Security lead",
+        "role": "Scopes work and coordinates the team.",
+    },
+    {
+        "profile": "recon",
+        "title": "Recon analyst",
+        "role": "Maps authorized targets and attack surface.",
+    },
+    {
+        "profile": "web-auditor",
+        "title": "Web auditor",
+        "role": "Reviews web applications and configurations.",
+    },
+    {
+        "profile": "vulnerability-analyst",
+        "title": "Vulnerability analyst",
+        "role": "Validates evidence and prioritizes findings.",
+    },
+    {
+        "profile": "report-writer",
+        "title": "Report writer",
+        "role": "Turns verified findings into remediation guidance.",
+    },
 )
 
 
-def parse_ai_response(response_text: str) -> tuple[str, str, str]:
-    """Return the action, its message, and an optional terminal command."""
-    response = json.loads(response_text)
-    if not isinstance(response, dict):
-        raise ValueError("The AI response must be a JSON object.")
-
-    action = response.get("action")
-    message = response.get("message", "")
-    if not isinstance(message, str):
-        raise ValueError("The AI response message must be text.")
-
-    if action == "chat":
-        return action, message, ""
-    if action != "command":
-        raise ValueError("The AI response action must be 'chat' or 'command'.")
-
-    command = response.get("command")
-    if not isinstance(command, str) or not command.strip():
-        raise ValueError("The AI did not provide a terminal command.")
-    command = command.strip()
-    if len(command) > MAX_COMMAND_LENGTH or any(char in command for char in ("\n", "\r", "\x00")):
-        raise ValueError("The terminal command is too long or contains invalid characters.")
-    return action, message, command
+class HermesKanbanError(RuntimeError):
+    """An explicit error returned by the local Hermes Kanban CLI."""
 
 
-def generate_model_response(
-    client: Client,
-    model: str,
-    system: str,
-    prompt: str,
-) -> tuple[str, str, str]:
-    response = client.generate(
-        model=model,
-        system=system,
-        prompt=prompt,
-        stream=False,
-        keep_alive="0",
-        options={"num_ctx": 4096, "num_predict": 300, "temperature": 0.2},
-    )
-    raw_response = response.get("response", "").strip()
-    if not raw_response:
-        raise ValueError(f'Ollama model "{model}" returned an empty response.')
-    return parse_ai_response(raw_response)
-
-
-def create_ollama_client() -> Client:
-    headers: dict[str, str] = {}
-    if IS_OFFICIAL_OLLAMA_CLOUD:
-        if OLLAMA_API_KEY:
-            headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
-    elif CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET:
-        headers["CF-Access-Client-Id"] = CF_ACCESS_CLIENT_ID
-        headers["CF-Access-Client-Secret"] = CF_ACCESS_CLIENT_SECRET
-    return Client(host=OLLAMA_HOST, headers=headers)
-
-
-def run_command_in_vm(
+def run_hermes_kanban(
     host: str,
+    port: int,
     username: str,
     password: str,
-    command: str,
-    key_filename: str = "",
-    key_passphrase: str = "",
-    timeout_seconds: int = 60,
-) -> str:
-    """Run a command only on a VM whose SSH host key is already trusted."""
+    key_filename: str,
+    key_passphrase: str,
+    known_hosts: str,
+    cli_path: str,
+    board: str,
+    arguments: list[str],
+    input_text: str | None = None,
+) -> Any:
+    """Run a fixed Hermes Kanban command over verified SSH without interpolating task data."""
     if not host.strip() or not username.strip():
-        raise ValueError("Set KALI_VM_IP and KALI_VM_USER before running VM commands.")
-    if not 1 <= timeout_seconds <= MAX_VM_COMMAND_TIMEOUT_SECONDS:
-        raise ValueError(
-            f"VM command timeout must be between 1 and {MAX_VM_COMMAND_TIMEOUT_SECONDS} seconds."
-        )
+        raise HermesKanbanError("Set KALI_VM_IP and KALI_VM_USER to connect to your Kali VM.")
+    if not password and not key_filename:
+        raise HermesKanbanError("Set KALI_VM_PASS or KALI_SSH_KEY for Kali VM authentication.")
 
+    command = " ".join(
+        shlex.quote(part) for part in (cli_path, "kanban", "--board", board, *arguments)
+    )
     ssh = paramiko.SSHClient()
-    ssh.load_system_host_keys()
-    known_hosts = os.getenv("KALI_SSH_KNOWN_HOSTS", "").strip()
-    if known_hosts:
-        ssh.load_host_keys(known_hosts)
-    ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
     try:
+        ssh.load_system_host_keys()
+        if known_hosts:
+            ssh.load_host_keys(known_hosts)
+        ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
         ssh.connect(
             hostname=host.strip(),
+            port=port,
             username=username.strip(),
             key_filename=key_filename.strip() or None,
             passphrase=key_passphrase or None,
@@ -158,55 +101,52 @@ def run_command_in_vm(
             allow_agent=False,
             look_for_keys=False,
         )
-        _, stdout, _ = ssh.exec_command(command, timeout=timeout_seconds)
+        stdin, stdout, _ = ssh.exec_command(
+            command,
+            timeout=HERMES_COMMAND_TIMEOUT_SECONDS,
+        )
+        if input_text is not None:
+            stdin.channel.sendall(input_text.encode("utf-8"))
+        stdin.channel.shutdown_write()
+
         channel = stdout.channel
         output = bytearray()
         error = bytearray()
-        output_truncated = False
-        error_truncated = False
-        deadline = time.monotonic() + timeout_seconds
-
+        deadline = time.monotonic() + HERMES_COMMAND_TIMEOUT_SECONDS
         while not channel.exit_status_ready() or channel.recv_ready() or channel.recv_stderr_ready():
             if time.monotonic() >= deadline:
                 channel.close()
-                raise TimeoutError(
-                    f"The VM command exceeded the {timeout_seconds}-second limit."
-                )
+                raise HermesKanbanError("Hermes Kanban did not respond before the 30-second limit.")
             received_data = False
             if channel.recv_ready():
-                chunk = channel.recv(32_768)
-                available = MAX_OUTPUT_LENGTH - len(output)
-                output.extend(chunk[:available])
-                output_truncated |= len(chunk) > available
+                output.extend(channel.recv(32_768))
                 received_data = True
             if channel.recv_stderr_ready():
-                chunk = channel.recv_stderr(32_768)
-                available = MAX_OUTPUT_LENGTH - len(error)
-                error.extend(chunk[:available])
-                error_truncated |= len(chunk) > available
+                error.extend(channel.recv_stderr(32_768))
                 received_data = True
+            if len(output) + len(error) > MAX_HERMES_OUTPUT_BYTES:
+                channel.close()
+                raise HermesKanbanError("Hermes Kanban returned more than 1 MB of output.")
             if not received_data:
                 time.sleep(0.05)
 
         exit_code = channel.recv_exit_status()
-        output_text = output.decode("utf-8", errors="replace").strip()
-        error_text = error.decode("utf-8", errors="replace").strip()
-        details = "\n".join(part for part in (output_text, error_text) if part)
-        if output_truncated or error_truncated:
-            details += "\n[Output truncated]"
-        if not details:
-            details = "(no output)"
-        return f"Exit code: {exit_code}\n{details}"
+        if exit_code:
+            detail = error.decode("utf-8", errors="replace").strip()
+            if detail:
+                raise HermesKanbanError(f"Hermes Kanban failed: {detail[-500:]}")
+            raise HermesKanbanError("Hermes Kanban failed without returning an error message.")
+
+        try:
+            return json.loads(output.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HermesKanbanError("Hermes Kanban returned invalid JSON.") from exc
     except paramiko.AuthenticationException as exc:
-        raise RuntimeError(
-            "SSH rejected the login. Check the VM username/password or configured private key."
+        raise HermesKanbanError(
+            "SSH authentication to the Kali VM failed. Check its username and password/key."
         ) from exc
-    except paramiko.SSHException as exc:
-        if "no authentication methods available" in str(exc).lower():
-            raise RuntimeError(
-                "The SSH server offered no usable login method. Configure a password or private key."
-            ) from exc
-        raise
+    except (OSError, paramiko.SSHException, TimeoutError) as exc:
+        raise HermesKanbanError(f"Could not connect to the Kali VM over verified SSH: {exc}") from exc
     finally:
         ssh.close()
 
@@ -225,6 +165,16 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     app.config.update(
         SECRET_KEY=os.getenv("FLASK_SECRET_KEY", ""),
         SITE_PASSWORD=os.getenv("SITE_PASSWORD", ""),
+        KALI_VM_IP=os.getenv("KALI_VM_IP", "").strip(),
+        KALI_SSH_PORT=os.getenv("KALI_SSH_PORT", "22").strip(),
+        KALI_VM_USER=os.getenv("KALI_VM_USER", "").strip(),
+        KALI_VM_PASS=os.getenv("KALI_VM_PASS", ""),
+        KALI_SSH_KEY=os.getenv("KALI_SSH_KEY", "").strip(),
+        KALI_SSH_KEY_PASSPHRASE=os.getenv("KALI_SSH_KEY_PASSPHRASE", ""),
+        KALI_SSH_KNOWN_HOSTS=os.getenv("KALI_SSH_KNOWN_HOSTS", "").strip(),
+        HERMES_CLI=HERMES_CLI,
+        HERMES_KANBAN_BOARD=HERMES_KANBAN_BOARD,
+        HERMES_TEAM_LEAD_PROFILE=HERMES_TEAM_LEAD_PROFILE,
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
         SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE", "").lower() == "true",
@@ -237,6 +187,20 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(
         minutes=app.config["SESSION_IDLE_TIMEOUT_MINUTES"]
     )
+
+    if not app.config["HERMES_CLI"].strip():
+        raise RuntimeError("HERMES_CLI must point to the Hermes Agent executable in Kali.")
+    try:
+        app.config["KALI_SSH_PORT"] = int(app.config["KALI_SSH_PORT"])
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("KALI_SSH_PORT must be a valid TCP port.") from exc
+    if not 1 <= app.config["KALI_SSH_PORT"] <= 65535:
+        raise RuntimeError("KALI_SSH_PORT must be between 1 and 65535.")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,62}", app.config["HERMES_KANBAN_BOARD"]):
+        raise RuntimeError("HERMES_KANBAN_BOARD must be a lowercase Kanban board slug.")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", app.config["HERMES_TEAM_LEAD_PROFILE"]):
+        raise RuntimeError("HERMES_TEAM_LEAD_PROFILE must be a valid Hermes profile name.")
+
     missing_settings = [
         name
         for name, value in (
@@ -249,15 +213,8 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         missing = ", ".join(missing_settings)
         raise RuntimeError(
             f"Missing required environment variable(s): {missing}. "
-            "Add them in your hosting provider's Variables and secrets settings, then restart the container."
+            "Set them in the local environment before starting the website."
         )
-    if bool(CF_ACCESS_CLIENT_ID) != bool(CF_ACCESS_CLIENT_SECRET):
-        raise RuntimeError(
-            "Set both CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET, or remove both, "
-            "to configure Cloudflare Access service authentication."
-        )
-    if urlparse(OLLAMA_HOST).hostname == "ollama.com" and not OLLAMA_API_KEY:
-        raise RuntimeError("Set OLLAMA_API_KEY when connecting directly to Ollama Cloud.")
 
     login_attempts: dict[str, deque[float]] = defaultdict(deque)
 
@@ -272,6 +229,21 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         supplied = request.headers.get("X-CSRF-Token") if request.is_json else request.form.get("csrf_token")
         expected = session.get("_csrf_token", "")
         return bool(supplied and expected and hmac.compare_digest(supplied, expected))
+
+    def run_team_kanban(arguments: list[str], input_text: str | None = None) -> Any:
+        return run_hermes_kanban(
+            app.config["KALI_VM_IP"],
+            app.config["KALI_SSH_PORT"],
+            app.config["KALI_VM_USER"],
+            app.config["KALI_VM_PASS"],
+            app.config["KALI_SSH_KEY"],
+            app.config["KALI_SSH_KEY_PASSPHRASE"],
+            app.config["KALI_SSH_KNOWN_HOSTS"],
+            app.config["HERMES_CLI"],
+            app.config["HERMES_KANBAN_BOARD"],
+            arguments,
+            input_text,
+        )
 
     @app.before_request
     def enforce_idle_timeout() -> Any:
@@ -325,7 +297,11 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     def login() -> Any:
         if session.get("authenticated"):
             return redirect(url_for("index"))
-        error = "You were signed out due to inactivity. Please sign in again." if request.args.get("expired") else None
+        error = (
+            "You were signed out due to inactivity. Please sign in again."
+            if request.args.get("expired")
+            else None
+        )
         return render_template("login.html", error=error)
 
     @app.post("/login")
@@ -339,7 +315,9 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         while attempts and now - attempts[0] > LOGIN_ATTEMPT_WINDOW:
             attempts.popleft()
         if len(attempts) >= MAX_LOGIN_ATTEMPTS:
-            return render_template("login.html", error="Too many attempts. Please wait before trying again."), 429
+            return render_template(
+                "login.html", error="Too many attempts. Please wait before trying again."
+            ), 429
 
         password = request.form.get("password", "")
         if not hmac.compare_digest(password, app.config["SITE_PASSWORD"]):
@@ -373,252 +351,90 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     @app.get("/")
     @login_required
     def index() -> Any:
-        csrf = csrf_token()
-        tool_confirmations = {
-            package: hmac.new(
-                app.config["SECRET_KEY"].encode("utf-8"),
-                f"{csrf}:install:{package}".encode("utf-8"),
-                sha256,
-            ).hexdigest()
-            for package in KALI_TOOL_CATALOG
-        } if ALLOW_TOOL_INSTALLS else {}
+        team_agents = [
+            {
+                **agent,
+                "profile": (
+                    app.config["HERMES_TEAM_LEAD_PROFILE"]
+                    if agent["profile"] == "security-lead"
+                    else agent["profile"]
+                ),
+            }
+            for agent in HERMES_TEAM_AGENTS
+        ]
         return render_template(
             "index.html",
-            model_name=MODEL_LABEL,
-            allow_vm_commands=ALLOW_VM_COMMANDS,
-            allow_tool_installs=ALLOW_TOOL_INSTALLS,
-            tool_catalog=KALI_TOOL_CATALOG if ALLOW_TOOL_INSTALLS else {},
-            tool_confirmations=tool_confirmations,
             idle_timeout_minutes=app.config["SESSION_IDLE_TIMEOUT_MINUTES"],
+            team_agents=team_agents,
+            kanban_board=app.config["HERMES_KANBAN_BOARD"],
         )
 
-    @app.post("/api/chat")
+    @app.get("/api/team")
     @login_required
-    def chat() -> Any:
+    def team_board() -> Any:
+        try:
+            tasks = run_team_kanban(["list", "--json"])
+        except HermesKanbanError as exc:
+            current_app.logger.warning("Could not load the Hermes Kanban board: %s", exc)
+            return jsonify(error=str(exc)), 502
+
+        if not isinstance(tasks, list) or any(
+            not isinstance(task, dict)
+            or not isinstance(task.get("id"), str)
+            or not isinstance(task.get("title"), str)
+            or task.get("status") not in HERMES_KANBAN_STATUSES
+            for task in tasks
+        ):
+            current_app.logger.error("Hermes Kanban list returned an unexpected JSON shape.")
+            return jsonify(error="Hermes Kanban returned an unexpected task list."), 502
+        return jsonify(tasks=tasks, agents=HERMES_TEAM_AGENTS, board=app.config["HERMES_KANBAN_BOARD"])
+
+    @app.post("/api/team/tasks")
+    @login_required
+    def create_team_task() -> Any:
         if not csrf_is_valid():
             return jsonify(error="Your session expired. Refresh the page and try again."), 400
         payload = request.get_json(silent=True)
         prompt = payload.get("prompt") if isinstance(payload, dict) else None
+        authorized = payload.get("authorized") if isinstance(payload, dict) else None
         if not isinstance(prompt, str) or not prompt.strip():
-            return jsonify(error="Enter a message first."), 400
+            return jsonify(error="Describe the assessment task first."), 400
         prompt = prompt.strip()
         if len(prompt) > MAX_PROMPT_LENGTH:
-            return jsonify(error=f"Messages must be {MAX_PROMPT_LENGTH} characters or fewer."), 400
+            return jsonify(error=f"Tasks must be {MAX_PROMPT_LENGTH} characters or fewer."), 400
+        if authorized is not True:
+            return jsonify(error="Confirm that you are authorized to assess the target."), 400
 
-        try:
-            client = create_ollama_client()
-            model_responses = [
-                (
-                    model,
-                    generate_model_response(client, model, SYSTEM_PROMPT, prompt),
-                )
-                for model in MODEL_NAMES
-            ]
-            synthesis_prompt = json.dumps(
-                {
-                    "user_request": prompt,
-                    "model_responses": [
-                        {
-                            "model": model,
-                            "action": response[0],
-                            "message": response[1],
-                            "command": response[2] if response[0] == "command" else "",
-                        }
-                        for model, response in model_responses
-                    ],
-                }
-            )
-            synthesis_action, message, _ = generate_model_response(
-                client,
-                MODEL_NAMES[0],
-                SYNTHESIS_SYSTEM_PROMPT,
-                synthesis_prompt,
-            )
-            if synthesis_action != "chat":
-                raise ValueError("The synthesis response must be a chat message.")
-
-            proposed_commands = [
-                response[2] for _, response in model_responses if response[0] == "command"
-            ]
-            command = ""
-            action = "chat"
-            if (
-                len(proposed_commands) == len(MODEL_NAMES)
-                and all(candidate == proposed_commands[0] for candidate in proposed_commands)
-            ):
-                action = "command"
-                command = proposed_commands[0]
-            elif proposed_commands:
-                message += "\n\nThe models disagreed on a command, so no command will be run."
-        except ResponseError as exc:
-            current_app.logger.exception("Ollama request failed.")
-            if exc.status_code in (401, 403):
-                host = urlparse(OLLAMA_HOST).hostname or "configured Ollama host"
-                detail = exc.error.strip()[:300]
-                if host == "ollama.com":
-                    message = "Ollama Cloud rejected authentication. Check the OLLAMA_API_KEY secret and account access."
-                else:
-                    message = (
-                        f"The configured Ollama endpoint ({host}) rejected authentication. "
-                        "If this tunnel is protected by Cloudflare Access, add a service token using "
-                        "CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET in the hosting secrets. "
-                        "Otherwise check the Ollama server or proxy's authentication settings."
-                    )
-                if detail:
-                    message += f" Server response: {detail}"
-            elif exc.status_code == 404:
-                missing_models = ", ".join(MODEL_NAMES)
-                message = (
-                    f"Ollama could not find one of the required models ({missing_models}). "
-                    "Pull both models on the Ollama server with `ollama pull hermes3` and "
-                    "`ollama pull qwen2.5:14b`."
-                )
-            else:
-                detail = exc.error.strip()[:300]
-                message = f"Ollama returned HTTP {exc.status_code}."
-                if detail:
-                    message += f" {detail}"
-            return jsonify(error=message), 502
-        except (ValueError, json.JSONDecodeError):
-            current_app.logger.exception("An Ollama model returned an invalid response.")
-            return jsonify(
-                error=(
-                    "An Ollama model returned a response in an unexpected format. "
-                    "Check that every configured model supports the assistant's required JSON response format."
-                )
-            ), 502
-        except RequestError:
-            current_app.logger.exception("Could not connect to Ollama.")
-            return jsonify(
-                error=(
-                    "Could not connect to Ollama. Set OLLAMA_HOST to the reachable Ollama server URL "
-                    "(for example, your Railway private service URL or Cloudflare tunnel URL), "
-                    "and confirm that server is running."
-                )
-            ), 502
-        except Exception:
-            current_app.logger.exception("Unexpected Ollama request failure.")
-            return jsonify(
-                error="The AI service failed unexpectedly. Check the application logs for the server-side details."
-            ), 502
-
-        result: dict[str, str] = {"action": action, "message": message or "(no response text)"}
-        if action == "command":
-            if not ALLOW_VM_COMMANDS:
-                result["action"] = "chat"
-                result["message"] += "\n\nVM command execution is disabled on this website."
-                return jsonify(result)
-            csrf = session.get("_csrf_token", "")
-            signature = hmac.new(
-                app.config["SECRET_KEY"].encode("utf-8"),
-                f"{csrf}:{command}".encode("utf-8"),
-                sha256,
-            ).hexdigest()
-            result["command"] = command
-            result["confirmation"] = signature
-        return jsonify(result)
-
-    @app.post("/api/execute")
-    @login_required
-    def execute_command() -> Any:
-        if not ALLOW_VM_COMMANDS:
-            return jsonify(error="VM command execution is disabled on this website."), 403
-        if not csrf_is_valid():
-            return jsonify(error="Your session expired. Refresh the page and try again."), 400
-        payload = request.get_json(silent=True)
-        command = payload.get("command") if isinstance(payload, dict) else None
-        confirmation = payload.get("confirmation") if isinstance(payload, dict) else None
-        if not isinstance(command, str) or not isinstance(confirmation, str):
-            return jsonify(error="A command confirmation is required."), 400
-        command = command.strip()
-        if (
-            not command
-            or len(command) > MAX_COMMAND_LENGTH
-            or any(character in command for character in ("\n", "\r", "\x00"))
-        ):
-            return jsonify(error="The command is empty, too long, or contains invalid characters."), 400
-        expected_confirmation = hmac.new(
-            app.config["SECRET_KEY"].encode("utf-8"),
-            f'{session.get("_csrf_token", "")}:{command}'.encode("utf-8"),
-            sha256,
-        ).hexdigest()
-        if not hmac.compare_digest(confirmation, expected_confirmation):
-            return jsonify(error="This command was not generated for your current session. Ask the assistant again."), 400
-
-        try:
-            result = run_command_in_vm(
-                os.getenv("KALI_VM_IP", ""),
-                os.getenv("KALI_VM_USER", ""),
-                os.getenv("KALI_VM_PASS", ""),
-                command,
-                os.getenv("KALI_SSH_KEY", ""),
-                os.getenv("KALI_SSH_KEY_PASSPHRASE", ""),
-            )
-        except Exception:
-            current_app.logger.exception("VM command failed.")
-            return jsonify(error="The VM command failed. Check server logs and VM configuration."), 502
-        return jsonify(result=result)
-
-    @app.post("/api/tools/install")
-    @login_required
-    def install_tool() -> Any:
-        if not ALLOW_TOOL_INSTALLS:
-            return jsonify(error="VM tool installation is disabled on this website."), 403
-        if not csrf_is_valid():
-            return jsonify(error="Your session expired. Refresh the page and try again."), 400
-
-        payload = request.get_json(silent=True)
-        package = payload.get("package") if isinstance(payload, dict) else None
-        confirmation = payload.get("confirmation") if isinstance(payload, dict) else None
-        if not isinstance(package, str) or package not in KALI_TOOL_CATALOG:
-            return jsonify(error="Choose a tool from the supported Kali package catalog."), 400
-        if not isinstance(confirmation, str):
-            return jsonify(error="Confirm this tool installation from the website first."), 400
-
-        expected_confirmation = hmac.new(
-            app.config["SECRET_KEY"].encode("utf-8"),
-            f'{session.get("_csrf_token", "")}:install:{package}'.encode("utf-8"),
-            sha256,
-        ).hexdigest()
-        if not hmac.compare_digest(confirmation, expected_confirmation):
-            return jsonify(error="This installation was not confirmed for your current session."), 400
-
-        command = (
-            "sudo -n apt-get update && "
-            f"sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y "
-            f"--no-install-recommends -- {package}"
+        title = prompt.splitlines()[0].strip()[:100]
+        title = f"Authorized assessment: {title}"
+        body = (
+            "The website user confirms this task is within an authorized assessment scope. "
+            "Do not access systems outside the scope stated below. If the scope is unclear, "
+            "request clarification before proceeding.\n\n"
+            f"{prompt}"
         )
         try:
-            result = run_command_in_vm(
-                os.getenv("KALI_VM_IP", ""),
-                os.getenv("KALI_VM_USER", ""),
-                os.getenv("KALI_VM_PASS", ""),
-                command,
-                os.getenv("KALI_SSH_KEY", ""),
-                os.getenv("KALI_SSH_KEY_PASSPHRASE", ""),
-                timeout_seconds=MAX_VM_COMMAND_TIMEOUT_SECONDS,
+            task = run_team_kanban(
+                [
+                    "create",
+                    title,
+                    "--body-file",
+                    "-",
+                    "--assignee",
+                    app.config["HERMES_TEAM_LEAD_PROFILE"],
+                    "--triage",
+                    "--json",
+                ],
+                input_text=body,
             )
-        except Exception:
-            current_app.logger.exception("Kali package installation failed.")
-            return jsonify(
-                error=(
-                    "The tool installation failed. Check the VM SSH configuration, package "
-                    "repositories, network access, and passwordless sudo permissions."
-                )
-            ), 502
-        if not result.startswith("Exit code: 0\n"):
-            current_app.logger.warning(
-                "APT installation of allowlisted package %s failed: %s",
-                package,
-                result[:1000],
-            )
-            return jsonify(
-                error=(
-                    f"APT could not install {package}. Check the VM's Kali APT repositories, "
-                    "permissions, and network access."
-                )
-            ), 502
-        return jsonify(package=package, result=result)
+        except HermesKanbanError as exc:
+            current_app.logger.warning("Could not create a Hermes Kanban task: %s", exc)
+            return jsonify(error=str(exc)), 502
+
+        if not isinstance(task, dict) or not isinstance(task.get("id"), str):
+            current_app.logger.error("Hermes Kanban create returned an unexpected JSON shape.")
+            return jsonify(error="Hermes Kanban returned an unexpected task response."), 502
+        return jsonify(task=task), 201
 
     return app
 
