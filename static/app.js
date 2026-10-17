@@ -100,7 +100,7 @@ async function postJson(path, payload) {
 async function askAssistant(prompt) {
   welcome.hidden = true;
   const userMessage = addMessage("YOU", prompt, true);
-  const assistant = addMessage("ASSISTANT", "Thinking…");
+  const assistant = addMessage("NIGASH", "Thinking…");
   sendButton.disabled = true;
   try {
     const result = await postJson("/api/chat", { prompt });
@@ -176,5 +176,34 @@ document.querySelectorAll(".suggestion").forEach((button) => {
   button.addEventListener("click", () => {
     promptInput.value = button.dataset.prompt;
     form.requestSubmit();
+  });
+});
+
+document.querySelectorAll(".install-tool-button").forEach((button) => {
+  button.addEventListener("click", async () => {
+    const packageName = button.dataset.package;
+    if (!window.confirm(
+      `Install ${packageName} from the Kali APT repositories on your configured VM? ` +
+      "This runs apt-get update and requires passwordless sudo."
+    )) return;
+
+    button.disabled = true;
+    button.textContent = "Installing…";
+    const card = button.closest(".tool-card");
+    try {
+      const result = await postJson("/api/tools/install", {
+        package: packageName,
+        confirmation: button.dataset.confirmation,
+      });
+      const output = document.createElement("pre");
+      output.className = "result-output";
+      output.textContent = result.result;
+      card.append(output);
+      button.textContent = "Finished";
+    } catch (error) {
+      button.disabled = false;
+      button.textContent = "Retry install";
+      showError(card, error.message);
+    }
   });
 });
